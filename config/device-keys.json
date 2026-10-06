@@ -1,0 +1,17 @@
+{
+  "keys": {
+    "sat-a01-ed25519-1": "pFwrfkWyLCPi57/LKba9XitXUGR/abupVdYF/JalkZk=",
+    "sat-b02-ed25519-1": "a0E3dPT8ue2S8ksuGdu6ds5+RATC+FNC81LE4jXrvA8=",
+    "pool-ed25519-1": "NHrjUt/9Tx7M/m2vQj2Eq4t8lhIXw9tQ6YAfeENtKXc="
+  },
+  "devices": {
+    "SAT-A01": {
+      "keyId": "sat-a01-ed25519-1",
+      "publicKey": "pFwrfkWyLCPi57/LKba9XitXUGR/abupVdYF/JalkZk="
+    },
+    "SAT-B02": {
+      "keyId": "sat-b02-ed25519-1",
+      "publicKey": "a0E3dPT8ue2S8ksuGdu6ds5+RATC+FNC81LE4jXrvA8="
+    }
+  }
+}

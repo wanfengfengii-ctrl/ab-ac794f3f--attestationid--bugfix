@@ -1,0 +1,19 @@
+{
+  "name": "satellite-attestation-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Satellite payload configuration attestation acceptance gateway (Ed25519, generation chaining, replay/rollback/fork protection)",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node tools/build-check.mjs",
+    "test": "node --test",
+    "smoke": "node tools/smoke.mjs",
+    "gen-keys": "node tools/gen-keys.mjs",
+    "verify": "node tools/verify.mjs"
+  },
+  "license": "UNLICENSED"
+}

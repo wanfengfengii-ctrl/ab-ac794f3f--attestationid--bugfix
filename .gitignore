@@ -1,0 +1,19 @@
+.DS_Store
+.env
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.pnpm-store/
+*.py[cod]
+
+# Service runtime data (durable attestation logs)
+data/
+
+# Generated test-only private key fixtures (regenerate with tools/gen-keys.mjs)
+test/fixtures/

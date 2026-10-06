@@ -1,0 +1,48 @@
+services:
+  # Long-running attestation acceptance API.
+  api:
+    build: .
+    image: satellite-attestation-gateway:latest
+    container_name: attestation-api
+    # Host-side port is configured solely by APP_PORT (default 8080); the
+    # container always listens on 8080 internally.
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      PORT: "8080"
+      DATA_DIR: /app/data
+      DEVICE_KEYS_FILE: /app/config/device-keys.json
+    volumes:
+      # Accepted attestation logs survive container recreation, so head
+      # generations remain unique and queryable across restarts.
+      - api-data:/app/data
+      # Deployment-declared device public keys, mounted read-only.
+      - ./config/device-keys.json:/app/config/device-keys.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # One-shot verification job: unit/integration tests, build check and the
+  # signature acceptance smoke (including concurrency and restart recovery).
+  # It exits on its own and summarizes everything in its exit code:
+  #   docker compose run --rm verify
+  # `docker compose up` also starts it once; a non-zero exit is visible in
+  # `docker compose ps` / CI without affecting the running api container.
+  verify:
+    build: .
+    image: satellite-attestation-gateway:latest
+    container_name: attestation-verify
+    command: ["node", "tools/verify.mjs"]
+    environment:
+      # The smoke harness spawns ephemeral loopback servers on OS-assigned
+      # ports and uses a private temp data dir inside this container.
+      PORT: "0"
+      DATA_DIR: /tmp/verify-data
+    restart: "no"
+
+volumes:
+  api-data:
