@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { AppError, ErrorCode } from './errors.mjs';
 import { verifyEd25519 } from './registry.mjs';
-import { sha256Hex } from './store.mjs';
+import { sha256Hex, sameAttestationIdentity } from './store.mjs';
 
 const MAX_ID_CHARS = 256;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/;
@@ -129,18 +129,24 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
     }
 
     // 4) Atomic, per-device-serialized chain decision + durable append.
+    const payloadSha256 = sha256Hex(payload.raw);
+    const candidate = {
+      deviceId: payload.deviceId,
+      keyId,
+      generation: payload.generation,
+      previousGeneration: payload.previousGeneration,
+      configSha256: payload.configSha256,
+      payloadSha256,
+    };
     const result = await store.accept(payload.deviceId, (head) => {
-      const previous = store.findAttestation(payload.deviceId, attestationId);
+      // attestationId is a GLOBAL idempotency identity across all devices.
+      const previous = store.findAcceptedAttestation(attestationId);
       if (previous) {
-        const sameContent =
-          previous.keyId === keyId &&
-          previous.generation === payload.generation &&
-          previous.previousGeneration === payload.previousGeneration &&
-          previous.configSha256 === payload.configSha256;
-        if (sameContent) {
+        if (sameAttestationIdentity(previous, candidate)) {
           return { action: 'replay', envelope: previous };
         }
-        // Same attestation number, different content -> conflict, no state change.
+        // Same attestation number, different content (or another device/key
+        // or different signed bytes) -> conflict, no state change anywhere.
         return {
           action: 'reject',
           status: 409,
@@ -148,6 +154,8 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
           message: 'attestationId was already accepted with different content',
           details: {
             attestationId,
+            acceptedDeviceId: previous.deviceId,
+            submittedDeviceId: payload.deviceId,
             acceptedGeneration: previous.generation,
             acceptedConfigSha256: previous.configSha256,
           },
@@ -209,6 +217,7 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
         generation: payload.generation,
         previousGeneration: payload.previousGeneration,
         configSha256: payload.configSha256,
+        payloadSha256,
         configSize: payload.raw.length,
         acceptedAt: clock().toISOString(),
       };
@@ -228,6 +237,7 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
         generation: result.envelope.generation,
         previousGeneration: result.envelope.previousGeneration,
         configSha256: result.envelope.configSha256,
+        payloadSha256: result.envelope.payloadSha256,
         acceptedAt: result.envelope.acceptedAt,
       },
       head: store.head(payload.deviceId),

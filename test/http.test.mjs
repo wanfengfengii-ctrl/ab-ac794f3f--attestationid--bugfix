@@ -13,9 +13,16 @@ import { generateDeviceKey, privateKeyFromSeed, signPayload, sha256Hex } from '.
 async function start() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'att-http-'));
   const d1 = generateDeviceKey();
+  const d2 = generateDeviceKey();
   const registry = DeviceRegistry.fromManifest({
-    keys: { 'key-1': d1.publicRaw.toString('base64') },
-    devices: { dev1: { keyId: 'key-1', publicKey: d1.publicRaw.toString('base64') } },
+    keys: {
+      'key-1': d1.publicRaw.toString('base64'),
+      'key-2': d2.publicRaw.toString('base64'),
+    },
+    devices: {
+      dev1: { keyId: 'key-1', publicKey: d1.publicRaw.toString('base64') },
+      dev2: { keyId: 'key-2', publicKey: d2.publicRaw.toString('base64') },
+    },
   });
   const store = new AttestationStore(path.join(dir, 'data'));
   await store.init();
@@ -25,9 +32,10 @@ async function start() {
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
   const priv = privateKeyFromSeed(d1.seed);
+  const priv2 = privateKeyFromSeed(d2.seed);
 
   const stop = () => new Promise((resolve) => server.close(resolve));
-  return { base, priv, stop };
+  return { base, priv, priv2, stop };
 }
 
 function submitBody(priv, payloadObj, attestationId = 'att-1') {
@@ -115,6 +123,90 @@ test('device id in path is URI decoded', async () => {
     // space and slash are encoded; unknown either way -> 404 stable code
     assert.equal(res.status, 404);
     assert.equal((await res.json()).error.code, 'DEVICE_NOT_FOUND');
+  } finally {
+    await stop();
+  }
+});
+
+function signedBody(priv, keyId, payloadObj, attestationId) {
+  const bytes = Buffer.from(JSON.stringify(payloadObj), 'utf8');
+  return {
+    attestationId,
+    keyId,
+    payloadBase64: bytes.toString('base64'),
+    signatureBase64: signPayload(priv, bytes),
+  };
+}
+
+function post(base, bodyObj) {
+  return fetch(`${base}/api/attestations`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(bodyObj),
+  });
+}
+
+test('shared attestationId across devices: second device gets 409 and no head', async () => {
+  const { base, priv, priv2, stop } = await start();
+  try {
+    const shaA = sha256Hex(Buffer.from('cfg-a'));
+    const shaB = sha256Hex(Buffer.from('cfg-b'));
+
+    const a = await post(base, signedBody(priv, 'key-1',
+      { deviceId: 'dev1', generation: 1, previousGeneration: 0, configSha256: shaA }, 'shared-att'));
+    assert.equal(a.status, 201);
+
+    const b = await post(base, signedBody(priv2, 'key-2',
+      { deviceId: 'dev2', generation: 1, previousGeneration: 0, configSha256: shaB }, 'shared-att'));
+    assert.equal(b.status, 409);
+    assert.equal((await b.json()).error.code, 'GENERATION_CONFLICT');
+
+    // Exact retry on the winner still replays over HTTP.
+    const retry = await post(base, signedBody(priv, 'key-1',
+      { deviceId: 'dev1', generation: 1, previousGeneration: 0, configSha256: shaA }, 'shared-att'));
+    assert.equal(retry.status, 200);
+    assert.equal((await retry.json()).replayed, true);
+
+    // Losing device has no head; winner unchanged.
+    const hb = await fetch(`${base}/api/devices/dev2/head`);
+    assert.equal(hb.status, 404);
+    const ha = await fetch(`${base}/api/devices/dev1/head`);
+    assert.equal(ha.status, 200);
+    assert.equal((await ha.json()).configSha256, shaA);
+
+    // Same id, same parsed fields, different signed bytes (extra field) -> 409.
+    const bytes = Buffer.from(JSON.stringify({
+      deviceId: 'dev1', generation: 1, previousGeneration: 0, configSha256: shaA, extra: 1,
+    }), 'utf8');
+    const mutated = {
+      attestationId: 'shared-att',
+      keyId: 'key-1',
+      payloadBase64: bytes.toString('base64'),
+      signatureBase64: signPayload(priv, bytes),
+    };
+    const c = await post(base, mutated);
+    assert.equal(c.status, 409);
+    assert.equal((await c.json()).error.code, 'GENERATION_CONFLICT');
+  } finally {
+    await stop();
+  }
+});
+
+test('cross-device concurrent POSTs of one id resolve to exactly one 201', async () => {
+  const { base, priv, priv2, stop } = await start();
+  try {
+    const shaA = sha256Hex(Buffer.from('cfg-a2'));
+    const shaB = sha256Hex(Buffer.from('cfg-b2'));
+    const [ra, rb] = await Promise.all([
+      post(base, signedBody(priv, 'key-1',
+        { deviceId: 'dev1', generation: 1, previousGeneration: 0, configSha256: shaA }, 'http-race')),
+      post(base, signedBody(priv2, 'key-2',
+        { deviceId: 'dev2', generation: 1, previousGeneration: 0, configSha256: shaB }, 'http-race')),
+    ]);
+    const statuses = [ra.status, rb.status].sort();
+    assert.deepEqual(statuses, [201, 409]);
+    const loser = ra.status === 409 ? ra : rb;
+    assert.equal((await loser.json()).error.code, 'GENERATION_CONFLICT');
   } finally {
     await stop();
   }

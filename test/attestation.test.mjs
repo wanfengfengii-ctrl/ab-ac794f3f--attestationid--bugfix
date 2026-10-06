@@ -29,7 +29,34 @@ async function harness() {
   const service = createAttestationService({ store, registry, maxPayloadBytes: 64 * 1024 });
   const priv1 = privateKeyFromSeed(d1.seed);
   const priv2 = privateKeyFromSeed(d2.seed);
-  return { dir, store, service, priv1, priv2, poolPriv: privateKeyFromSeed(pool.seed) };
+  return {
+    dir,
+    store,
+    service,
+    registry,
+    keys: {
+      'key-1': d1.publicRaw.toString('base64'),
+      'key-2': d2.publicRaw.toString('base64'),
+      'key-pool': pool.publicRaw.toString('base64'),
+    },
+    priv1,
+    priv2,
+    poolPriv: privateKeyFromSeed(pool.seed),
+  };
+}
+
+async function reopen(h) {
+  const registry = DeviceRegistry.fromManifest({
+    keys: { ...h.keys },
+    devices: {
+      dev1: { keyId: 'key-1', publicKey: h.keys['key-1'] },
+      dev2: { keyId: 'key-2', publicKey: h.keys['key-2'] },
+    },
+  });
+  const store = new AttestationStore(path.join(h.dir, 'data'));
+  await store.init();
+  const service = createAttestationService({ store, registry, maxPayloadBytes: 64 * 1024 });
+  return { store, service };
 }
 
 function config(seed) {
@@ -39,6 +66,15 @@ function config(seed) {
 
 function body(priv, keyId, payload, attestationId = `att-${Math.random().toString(36).slice(2)}`) {
   const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
+  return {
+    attestationId,
+    keyId,
+    payloadBase64: payloadBytes.toString('base64'),
+    signatureBase64: signPayload(priv, payloadBytes),
+  };
+}
+
+function bodyFromBytes(priv, keyId, payloadBytes, attestationId) {
   return {
     attestationId,
     keyId,
@@ -216,4 +252,143 @@ test('an undeclared pool key may onboard a new device but cannot attest a bound 
 test('head of unknown device throws DEVICE_NOT_FOUND', async () => {
   const { service } = await harness();
   assert.throws(() => service.head('ghost'), (err) => err.status === 404 && err.code === 'DEVICE_NOT_FOUND');
+});
+
+test('GLOBAL: same attestation id accepted by a second device is a cross-device conflict', async () => {
+  const h = await harness();
+  const { service, store, priv1, priv2 } = h;
+  const ca = config('cfg-dev-a');
+  const cb = config('cfg-dev-b');
+
+  const ra = await service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, ca.sha), 'shared-id'));
+  assert.equal(ra.replayed, false);
+  assert.equal(ra.head.deviceId, 'dev1');
+
+  await assert.rejects(
+    () => service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, cb.sha), 'shared-id')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+
+  // The loser's device got no head at all; the winner's head is untouched.
+  assert.equal(store.head('dev2'), null);
+  assert.equal(service.head('dev1').generation, 1);
+  assert.equal(service.head('dev1').configSha256, ca.sha);
+  // The global index still resolves the id to the first device's envelope.
+  const indexed = store.findAcceptedAttestation('shared-id');
+  assert.equal(indexed.deviceId, 'dev1');
+  assert.equal(indexed.keyId, 'key-1');
+  assert.ok(indexed.payloadSha256);
+});
+
+test('GLOBAL: cross-device conflict verdict is stable across both submission orders', async () => {
+  for (const first of ['dev1', 'dev2']) {
+    const h = await harness();
+    const { service, store } = h;
+    const priv = { dev1: h.priv1, dev2: h.priv2 };
+    const key = { dev1: 'key-1', dev2: 'key-2' };
+    const sha = { dev1: config('cfg-dev-a').sha, dev2: config('cfg-dev-b').sha };
+    const other = first === 'dev1' ? 'dev2' : 'dev1';
+
+    await service.submit(body(priv[first], key[first], payload(first, 1, 0, sha[first]), 'shared-id'));
+    await assert.rejects(
+      () => service.submit(body(priv[other], key[other], payload(other, 1, 0, sha[other]), 'shared-id')),
+      (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+    );
+    assert.equal(service.head(first).deviceId, first);
+    assert.equal(store.head(other), null);
+  }
+});
+
+test('GLOBAL: same-device exact retry with the same id replays, incl. across a restart', async () => {
+  const h = await harness();
+  const { service, priv1 } = h;
+  const c1 = config('cfg-1');
+
+  const r1 = await service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'replay-id'));
+  assert.equal(r1.replayed, false);
+  const r2 = await service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'replay-id'));
+  assert.equal(r2.replayed, true);
+  assert.equal(r2.accepted.attestationId, 'replay-id');
+  assert.equal(r2.accepted.payloadSha256, r1.accepted.payloadSha256);
+
+  // Restart: the verdict for the shared number must stay identical.
+  const reopened = await reopen(h);
+  assert.equal(reopened.service.head('dev1').generation, 1);
+  const r3 = await reopened.service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'replay-id'));
+  assert.equal(r3.replayed, true);
+  assert.equal(r3.accepted.acceptedAt, r1.accepted.acceptedAt);
+  assert.equal(reopened.service.head('dev1').generation, 1);
+});
+
+test('GLOBAL: identical parsed fields but different signed bytes (extra field) conflicts', async () => {
+  const h = await harness();
+  const { service, store, priv1 } = h;
+  const c1 = config('cfg-1');
+
+  const baseBytes = Buffer.from(JSON.stringify(payload('dev1', 1, 0, c1.sha)), 'utf8');
+  const tampered = Buffer.from(
+    JSON.stringify({ ...payload('dev1', 1, 0, c1.sha), note: 'extra signed field' }),
+    'utf8',
+  );
+  assert.notDeepEqual(baseBytes, tampered);
+
+  await service.submit(bodyFromBytes(priv1, 'key-1', baseBytes, 'byte-id'));
+  await assert.rejects(
+    () => service.submit(bodyFromBytes(priv1, 'key-1', tampered, 'byte-id')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+  // Byte-level difference (whitespace) with the very same parsed object also conflicts.
+  const respaced = Buffer.from(JSON.stringify(payload('dev1', 1, 0, c1.sha), null, 2), 'utf8');
+  await assert.rejects(
+    () => service.submit(bodyFromBytes(priv1, 'key-1', respaced, 'byte-id')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+  assert.equal(store.head('dev1').generation, 1);
+  assert.equal(store.head('dev1').configSha256, c1.sha);
+});
+
+test('GLOBAL: cross-device concurrent submit of the same id accepts exactly one deterministically', async () => {
+  const h = await harness();
+  const { service, store, priv1, priv2 } = h;
+  const ca = config('cfg-dev-a');
+  const cb = config('cfg-dev-b');
+
+  const results = await Promise.allSettled([
+    service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, ca.sha), 'race-id')),
+    service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, cb.sha), 'race-id')),
+  ]);
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.status, 409);
+  assert.equal(rejected[0].reason.code, 'GENERATION_CONFLICT');
+
+  const winnerDevice = fulfilled[0].value.head.deviceId;
+  const winnerSha = winnerDevice === 'dev1' ? ca.sha : cb.sha;
+  const loserDevice = winnerDevice === 'dev1' ? 'dev2' : 'dev1';
+  assert.equal(service.head(winnerDevice).configSha256, winnerSha);
+  assert.equal(store.head(loserDevice), null);
+  assert.equal(store.findAcceptedAttestation('race-id').deviceId, winnerDevice);
+});
+
+test('GLOBAL: after restart the same id still conflicts on the other device', async () => {
+  const h = await harness();
+  const { service, priv1, priv2 } = h;
+  const ca = config('cfg-dev-a');
+  const cb = config('cfg-dev-b');
+  await service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, ca.sha), 'restart-id'));
+
+  const reopened = await reopen(h);
+  await assert.rejects(
+    () => reopened.service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, cb.sha), 'restart-id')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+  assert.equal(reopened.store.head('dev2'), null);
+  assert.equal(reopened.service.head('dev1').configSha256, ca.sha);
+
+  // A genuinely new number on the second device still onboards normally.
+  const r = await reopened.service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, cb.sha), 'fresh-id'));
+  assert.equal(r.replayed, false);
+  assert.equal(r.head.deviceId, 'dev2');
 });

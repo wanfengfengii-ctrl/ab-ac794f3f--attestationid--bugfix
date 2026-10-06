@@ -82,6 +82,10 @@ async function scenario(baseUrl, keys) {
   const cfg1 = makeConfig(JSON.stringify({ name: 'payload-config', version: 1, txPower: 12 }));
   const cfg1b = makeConfig(JSON.stringify({ name: 'payload-config', version: 1, txPower: 13 }));
   const cfg2 = makeConfig(JSON.stringify({ name: 'payload-config', version: 2, txPower: 12 }));
+  // Final DEVICE head generation, returned for restart assertions (the
+  // cross-device race may or may not advance it).
+  let finalDeviceGeneration = 4;
+  let finalOtherGeneration = 1;
 
   // --- health ---
   {
@@ -140,6 +144,62 @@ async function scenario(baseUrl, keys) {
       `status=${r.status} body=${JSON.stringify(r.json)}`);
     const h = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(DEVICE)}/head`);
     check('conflict did not change accepted sha', h.json?.configSha256 === cfg1.sha);
+  }
+
+  // --- same number, same parsed fields, but different signed bytes (extra field) -> 409 ---
+  {
+    const r = await api(baseUrl, 'POST', '/api/attestations', envelope({
+      keyId: mine.keyId, priv: mine.priv,
+      payload: { deviceId: DEVICE, generation: 1, previousGeneration: 0, configSha256: cfg1.sha, nonce: 'extra-signed-field' },
+      attestationId: firstId,
+    }));
+    check('same id + extra signed JSON field (different bytes) -> 409 GENERATION_CONFLICT',
+      r.status === 409 && r.json?.error?.code === 'GENERATION_CONFLICT',
+      `status=${r.status} body=${JSON.stringify(r.json)}`);
+  }
+
+  // --- GLOBAL idempotency: the same number is accepted by exactly one device ---
+  const cfgOther1 = makeConfig(JSON.stringify({ name: 'other-payload-config', version: 1 }));
+  const crossId = randomId('att');
+  {
+    // The other device legitimately onboards with this attestation number.
+    const r = await api(baseUrl, 'POST', '/api/attestations', envelope({
+      keyId: other.keyId, priv: other.priv,
+      payload: { deviceId: OTHER_DEVICE, generation: 1, previousGeneration: 0, configSha256: cfgOther1.sha },
+      attestationId: crossId,
+    }));
+    check('cross-device: first device accepts the shared id (201)',
+      r.status === 201 && r.json?.head?.deviceId === OTHER_DEVICE && r.json?.head?.generation === 1,
+      `status=${r.status} body=${JSON.stringify(r.json)}`);
+    const h = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(OTHER_DEVICE)}/head`);
+    check('cross-device: accepting device formed its gen-1 head',
+      h.status === 200 && h.json?.configSha256 === cfgOther1.sha, JSON.stringify(h.json));
+
+    // Exact retry by the winning device replays the original result.
+    const replay = await api(baseUrl, 'POST', '/api/attestations', envelope({
+      keyId: other.keyId, priv: other.priv,
+      payload: { deviceId: OTHER_DEVICE, generation: 1, previousGeneration: 0, configSha256: cfgOther1.sha },
+      attestationId: crossId,
+    }));
+    check('cross-device: exact retry on the winner replays (200)',
+      replay.status === 200 && replay.json?.replayed === true,
+      `status=${replay.status} body=${JSON.stringify(replay.json)}`);
+
+    // The first device reusing the same number (different device/key/payload)
+    // must conflict and neither create its submission nor move the winner.
+    const clash = await api(baseUrl, 'POST', '/api/attestations', envelope({
+      keyId: mine.keyId, priv: mine.priv,
+      payload: { deviceId: DEVICE, generation: 2, previousGeneration: 1, configSha256: cfg2.sha },
+      attestationId: crossId,
+    }));
+    check('cross-device: second device reusing the id -> 409 GENERATION_CONFLICT',
+      clash.status === 409 && clash.json?.error?.code === 'GENERATION_CONFLICT',
+      `status=${clash.status} body=${JSON.stringify(clash.json)}`);
+    const hMine = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(DEVICE)}/head`);
+    const hOther = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(OTHER_DEVICE)}/head`);
+    check('cross-device: conflict advanced neither head (mine=1, other=1)',
+      hMine.json?.generation === 1 && hOther.json?.generation === 1 && hOther.json?.configSha256 === cfgOther1.sha,
+      `mine=${JSON.stringify(hMine.json)} other=${JSON.stringify(hOther.json)}`);
   }
 
   // --- stale predecessor (jump claiming prev=0 while head is 1) ---
@@ -263,6 +323,60 @@ async function scenario(baseUrl, keys) {
       `status=${r4.status} body=${JSON.stringify(r4.json)}`);
   }
 
+  // --- cross-device concurrent race: both devices claim one fresh id in parallel ---
+  {
+    const crossRaceId = randomId('att');
+    const cfgMine5 = makeConfig(JSON.stringify({ name: 'payload-config', version: 5 }));
+    const cfgOther2 = makeConfig(JSON.stringify({ name: 'other-payload-config', version: 2 }));
+    const [ra, rb] = await Promise.all([
+      api(baseUrl, 'POST', '/api/attestations', envelope({
+        keyId: mine.keyId, priv: mine.priv,
+        payload: { deviceId: DEVICE, generation: 5, previousGeneration: 4, configSha256: cfgMine5.sha },
+        attestationId: crossRaceId,
+      })),
+      api(baseUrl, 'POST', '/api/attestations', envelope({
+        keyId: other.keyId, priv: other.priv,
+        payload: { deviceId: OTHER_DEVICE, generation: 2, previousGeneration: 1, configSha256: cfgOther2.sha },
+        attestationId: crossRaceId,
+      })),
+    ]);
+    const accepted = [ra, rb].filter((r) => r.status === 201);
+    const losers = [ra, rb].filter((r) => r.status !== 201);
+    check('cross-device race: exactly one of two devices accepts the shared id',
+      accepted.length === 1 && losers.length === 1 &&
+        losers[0].status === 409 && losers[0].json?.error?.code === 'GENERATION_CONFLICT',
+      `statuses=${[ra.status, rb.status].join(',')} loser=${JSON.stringify(losers[0]?.json)}`);
+
+    const winner = accepted[0]?.json?.head?.deviceId;
+    const hMine = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(DEVICE)}/head`);
+    const hOther = await api(baseUrl, 'GET', `/api/devices/${encodeURIComponent(OTHER_DEVICE)}/head`);
+    if (winner === DEVICE) {
+      finalDeviceGeneration = 5;
+      check('cross-device race: DEVICE advanced to 5, OTHER stayed at 1',
+        hMine.json?.generation === 5 && hMine.json?.configSha256 === cfgMine5.sha &&
+          hOther.json?.generation === 1 && hOther.json?.configSha256 === cfgOther1.sha,
+        `mine=${JSON.stringify(hMine.json)} other=${JSON.stringify(hOther.json)}`);
+    } else {
+      finalOtherGeneration = 2;
+      check('cross-device race: OTHER advanced to 2, DEVICE stayed at 4',
+        hOther.json?.generation === 2 && hOther.json?.configSha256 === cfgOther2.sha &&
+          hMine.json?.generation === 4,
+        `mine=${JSON.stringify(hMine.json)} other=${JSON.stringify(hOther.json)}`);
+    }
+    // Retrying the loser's exact request is still a conflict (same id, now taken).
+    const loserRetry = winner === DEVICE
+      ? envelope({ keyId: other.keyId, priv: other.priv,
+          payload: { deviceId: OTHER_DEVICE, generation: 2, previousGeneration: 1, configSha256: cfgOther2.sha },
+          attestationId: crossRaceId })
+      : envelope({ keyId: mine.keyId, priv: mine.priv,
+          payload: { deviceId: DEVICE, generation: 5, previousGeneration: 4, configSha256: cfgMine5.sha },
+          attestationId: crossRaceId });
+    const rr = await api(baseUrl, 'POST', '/api/attestations', loserRetry);
+    check('cross-device race: loser deterministic conflict on serial retry too',
+      rr.status === 409 && rr.json?.error?.code === 'GENERATION_CONFLICT',
+      `status=${rr.status} body=${JSON.stringify(rr.json)}`);
+  }
+
   // --- malformed inputs get stable 400 codes ---
   {
     const r = await fetch(new URL('/api/attestations', baseUrl), { method: 'POST', body: 'not-json' });
@@ -286,6 +400,8 @@ async function scenario(baseUrl, keys) {
     check('payload missing fields -> 400 INVALID_PAYLOAD', r.status === 400 && r.json?.error?.code === 'INVALID_PAYLOAD',
       JSON.stringify(r.json));
   }
+
+  return { crossId, finalDeviceGeneration, finalOtherGeneration };
 }
 
 function ErrorCodeSafe(r) {
@@ -339,9 +455,9 @@ async function selfContainedMode() {
   const baseUrl = `http://127.0.0.1:${server.port}`;
   console.log(`SMOKE self-contained server on ${baseUrl} (data ${dataDir})`);
 
-  await scenario(baseUrl, loadKeys(fixturesFile));
+  const summary = await scenario(baseUrl, loadKeys(fixturesFile));
 
-  // --- hard restart: same DATA_DIR, new process, head must be recovered ---
+  // --- hard restart: same DATA_DIR, new process, heads must be recovered ---
   const code = await server.stop('SIGTERM');
   check('server exits cleanly on SIGTERM', code === 0, `exit=${code}`);
 
@@ -349,26 +465,66 @@ async function selfContainedMode() {
   const baseUrl2 = `http://127.0.0.1:${server.port}`;
   {
     const h = await api(baseUrl2, 'GET', `/api/devices/${encodeURIComponent(DEVICE)}/head`);
-    check('after restart head is still the unique generation 4 with same sha',
-      h.status === 200 && h.json?.generation === 4 && typeof h.json?.configSha256 === 'string',
+    check('after restart DEVICE head is recovered at the pre-restart generation',
+      h.status === 200 && h.json?.generation === summary.finalDeviceGeneration &&
+        typeof h.json?.configSha256 === 'string',
       JSON.stringify(h.json));
+    const ho = await api(baseUrl2, 'GET', `/api/devices/${encodeURIComponent(OTHER_DEVICE)}/head`);
+    check('after restart OTHER head is recovered at the pre-restart generation',
+      ho.status === 200 && ho.json?.generation === summary.finalOtherGeneration,
+      JSON.stringify(ho.json));
   }
   {
-    // After restart, predecessor chain continues to validate against recovered head.
+    // Post-restart dedup verdict is identical: exact replay on the winning
+    // device returns 200, reuse of the same number on the other device is 409
+    // and advances neither head.
     const keys = loadKeys(fixturesFile);
     const mine = keys[DEVICE];
+    const other = keys[OTHER_DEVICE];
+    const cfgOther1 = makeConfig(JSON.stringify({ name: 'other-payload-config', version: 1 }));
+    const cfgNext = makeConfig(JSON.stringify({ name: 'payload-config', version: 'post-restart' }));
+
+    const replay = await api(baseUrl2, 'POST', '/api/attestations', envelope({
+      keyId: other.keyId, priv: other.priv,
+      payload: { deviceId: OTHER_DEVICE, generation: 1, previousGeneration: 0, configSha256: cfgOther1.sha },
+      attestationId: summary.crossId,
+    }));
+    check('after restart shared id still replays on the original winner',
+      replay.status === 200 && replay.json?.replayed === true,
+      `status=${replay.status} body=${JSON.stringify(replay.json)}`);
+
+    const clash = await api(baseUrl2, 'POST', '/api/attestations', envelope({
+      keyId: mine.keyId, priv: mine.priv,
+      payload: {
+        deviceId: DEVICE,
+        generation: summary.finalDeviceGeneration + 1,
+        previousGeneration: summary.finalDeviceGeneration,
+        configSha256: cfgNext.sha,
+      },
+      attestationId: summary.crossId,
+    }));
+    check('after restart shared id reused by another device still -> 409',
+      clash.status === 409 && clash.json?.error?.code === 'GENERATION_CONFLICT',
+      `status=${clash.status} body=${JSON.stringify(clash.json)}`);
+
+    // After restart, predecessor chain continues to validate against recovered head.
     const prev = (await api(baseUrl2, 'GET', `/api/devices/${encodeURIComponent(DEVICE)}/head`)).json;
-    const cfg5 = makeConfig(JSON.stringify({ name: 'payload-config', version: 5 }));
     const r = await api(baseUrl2, 'POST', '/api/attestations', envelope({
       keyId: mine.keyId, priv: mine.priv,
-      payload: { deviceId: DEVICE, generation: 5, previousGeneration: prev.generation, configSha256: cfg5.sha },
+      payload: {
+        deviceId: DEVICE,
+        generation: prev.generation + 1,
+        previousGeneration: prev.generation,
+        configSha256: cfgNext.sha,
+      },
     }));
-    check('after restart chain advances (gen 5)', r.status === 201 && r.json?.head?.generation === 5,
+    check('after restart chain advances one generation',
+      r.status === 201 && r.json?.head?.generation === prev.generation + 1,
       `status=${r.status} body=${JSON.stringify(r.json)}`);
     // old predecessor is now stale
     const stale = await api(baseUrl2, 'POST', '/api/attestations', envelope({
       keyId: mine.keyId, priv: mine.priv,
-      payload: { deviceId: DEVICE, generation: 6, previousGeneration: 3, configSha256: cfg5.sha },
+      payload: { deviceId: DEVICE, generation: prev.generation + 2, previousGeneration: 3, configSha256: cfgNext.sha },
     }));
     check('after restart stale predecessor rejected', stale.status === 409 && stale.json?.error?.code === 'PREDECESSOR_MISMATCH');
   }
