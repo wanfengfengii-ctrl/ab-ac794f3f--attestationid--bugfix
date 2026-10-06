@@ -70,7 +70,7 @@ export function parsePayload(rawBytes, maxPayloadBytes) {
     throw new AppError(400, ErrorCode.INVALID_PAYLOAD, 'payload.configSha256 must be 64 lowercase hex characters (SHA-256)');
   }
 
-  return { deviceId, generation, previousGeneration, configSha256, raw: rawBytes };
+  return { deviceId, generation, previousGeneration, configSha256, raw: rawBytes, sha256: sha256Hex(rawBytes) };
 }
 
 function validateEnvelopeFields(body) {
@@ -88,9 +88,10 @@ function validateEnvelopeFields(body) {
 }
 
 /**
- * Core use case. All state transitions go through store.accept(), which
- * serializes decisions per device — verification happens before taking the
- * lock, but every state-changing decision is made atomically inside it.
+ * Core use case. Every state transition goes through store.accept(), which
+ * serializes all decisions on a single global commit chain — verification
+ * happens before taking the chain, but the global attestationId uniqueness
+ * check and every state-changing decision are made atomically inside it.
  */
 export function createAttestationService({ store, registry, maxPayloadBytes, clock = () => new Date() }) {
   async function submit(rawBody) {
@@ -128,15 +129,17 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
       );
     }
 
-    // 4) Atomic, per-device-serialized chain decision + durable append.
+    // 4) Atomic global-id check + per-device chain decision + durable append.
     const result = await store.accept(payload.deviceId, (head) => {
-      const previous = store.findAttestation(payload.deviceId, attestationId);
+      const previous = store.findAttestation(attestationId);
       if (previous) {
+        // Exact replay: same device, same key, byte-identical signed payload.
+        // Any difference — device, key, extra field or signed-byte change —
+        // means the same acceptance number denotes different business content.
         const sameContent =
+          previous.deviceId === payload.deviceId &&
           previous.keyId === keyId &&
-          previous.generation === payload.generation &&
-          previous.previousGeneration === payload.previousGeneration &&
-          previous.configSha256 === payload.configSha256;
+          previous.payloadSha256 === payload.sha256;
         if (sameContent) {
           return { action: 'replay', envelope: previous };
         }
@@ -148,8 +151,13 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
           message: 'attestationId was already accepted with different content',
           details: {
             attestationId,
+            acceptedDeviceId: previous.deviceId,
+            acceptedKeyId: previous.keyId,
             acceptedGeneration: previous.generation,
-            acceptedConfigSha256: previous.configSha256,
+            acceptedPayloadSha256: previous.payloadSha256,
+            submittedDeviceId: payload.deviceId,
+            submittedKeyId: keyId,
+            submittedPayloadSha256: payload.sha256,
           },
         };
       }
@@ -209,6 +217,10 @@ export function createAttestationService({ store, registry, maxPayloadBytes, clo
         generation: payload.generation,
         previousGeneration: payload.previousGeneration,
         configSha256: payload.configSha256,
+        // Hash of the exact signed payload bytes; pins any extra fields or
+        // byte-level re-encoding so a logically-equal but different signed
+        // JSON body cannot masquerade as an idempotent replay.
+        payloadSha256: payload.sha256,
         configSize: payload.raw.length,
         acceptedAt: clock().toISOString(),
       };

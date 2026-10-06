@@ -29,7 +29,7 @@ async function harness() {
   const service = createAttestationService({ store, registry, maxPayloadBytes: 64 * 1024 });
   const priv1 = privateKeyFromSeed(d1.seed);
   const priv2 = privateKeyFromSeed(d2.seed);
-  return { dir, store, service, priv1, priv2, poolPriv: privateKeyFromSeed(pool.seed) };
+  return { dir, registry, store, service, priv1, priv2, poolPriv: privateKeyFromSeed(pool.seed) };
 }
 
 function config(seed) {
@@ -39,6 +39,10 @@ function config(seed) {
 
 function body(priv, keyId, payload, attestationId = `att-${Math.random().toString(36).slice(2)}`) {
   const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
+  return bodyBytes(priv, keyId, payloadBytes, attestationId);
+}
+
+function bodyBytes(priv, keyId, payloadBytes, attestationId) {
   return {
     attestationId,
     keyId,
@@ -93,6 +97,140 @@ test('same attestation id with different content conflicts and never mutates sta
   );
   assert.equal(service.head('dev1').configSha256, c1.sha);
   assert.equal(service.head('dev1').generation, 1);
+});
+
+test('same id reused by a different device (different key/config) is 409 and creates no head', async () => {
+  const { service, store, priv1, priv2 } = await harness();
+  const c1 = config('cfg-dev1');
+  const c2 = config('cfg-dev2');
+
+  const r1 = await service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'shared-att'));
+  assert.equal(r1.replayed, false);
+  assert.equal(r1.head.deviceId, 'dev1');
+
+  await assert.rejects(
+    () => service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, c2.sha), 'shared-att')),
+    (err) => {
+      if (err.status !== 409 || err.code !== 'GENERATION_CONFLICT') return false;
+      assert.equal(err.details.acceptedDeviceId, 'dev1');
+      assert.equal(err.details.submittedDeviceId, 'dev2');
+      return true;
+    },
+  );
+
+  // The conflict neither created dev2's head nor moved dev1.
+  assert.equal(store.head('dev2'), null);
+  assert.equal(service.head('dev1').generation, 1);
+  assert.equal(service.head('dev1').configSha256, c1.sha);
+
+  // A fresh, unused id for dev2 is accepted normally.
+  const r2 = await service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, c2.sha), 'att-dev2'));
+  assert.equal(r2.replayed, false);
+  assert.equal(r2.head.deviceId, 'dev2');
+  assert.equal(r2.head.generation, 1);
+});
+
+test('same-device exact byte-for-byte retry replays the first acceptance', async () => {
+  const { service, priv1 } = await harness();
+  const c1 = config('cfg-1');
+  const bytes = Buffer.from(JSON.stringify(payload('dev1', 1, 0, c1.sha)), 'utf8');
+
+  const r1 = await service.submit(bodyBytes(priv1, 'key-1', bytes, 'exact-1'));
+  assert.equal(r1.replayed, false);
+
+  // Re-sign the identical bytes (new signature) but keep the exact payload.
+  const r2 = await service.submit(bodyBytes(priv1, 'key-1', Buffer.from(bytes), 'exact-1'));
+  assert.equal(r2.replayed, true);
+  assert.equal(r2.accepted.attestationId, 'exact-1');
+  assert.equal(service.head('dev1').generation, 1);
+  assert.equal(service.head('dev1').configSha256, c1.sha);
+});
+
+test('same id with identical logical fields but changed signed bytes (extra field) is 409', async () => {
+  const { service, store, priv1 } = await harness();
+  const c1 = config('cfg-1');
+  const base = { deviceId: 'dev1', generation: 1, previousGeneration: 0, configSha256: c1.sha };
+
+  await service.submit(bodyBytes(priv1, 'key-1', Buffer.from(JSON.stringify(base), 'utf8'), 'bytes-1'));
+
+  // keyId/generation/previousGeneration/configSha256 unchanged, but an extra
+  // signed field (and thus different exact signed JSON) must conflict.
+  const altered = { ...base, nonce: 'different-bytes' };
+  await assert.rejects(
+    () => service.submit(bodyBytes(priv1, 'key-1', Buffer.from(JSON.stringify(altered), 'utf8'), 'bytes-1')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+
+  // Same via pure byte re-encoding (field order / whitespace), still signed.
+  const reordered = Buffer.from(
+    JSON.stringify(Object.fromEntries(Object.entries(base).reverse())),
+    'utf8',
+  );
+  assert.notDeepEqual(reordered.toString(), JSON.stringify(base));
+  await assert.rejects(
+    () => service.submit(bodyBytes(priv1, 'key-1', reordered, 'bytes-1')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+
+  assert.equal(service.head('dev1').generation, 1);
+  assert.equal(service.head('dev1').configSha256, c1.sha);
+  void store;
+});
+
+test('concurrent cross-device reuse of one id: exactly one deterministic winner', async () => {
+  const { service, store, priv1, priv2 } = await harness();
+  const c1 = config('cfg-dev1');
+  const c2 = config('cfg-dev2');
+
+  const results = await Promise.allSettled([
+    service.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'race-att')),
+    service.submit(body(priv2, 'key-2', payload('dev2', 1, 0, c2.sha), 'race-att')),
+  ]);
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.status, 409);
+  assert.equal(rejected[0].reason.code, 'GENERATION_CONFLICT');
+
+  const winner = fulfilled[0].value.accepted.deviceId;
+  assert.ok(winner === 'dev1' || winner === 'dev2');
+  const loser = winner === 'dev1' ? 'dev2' : 'dev1';
+
+  // Loser has no head; winner's head is its own config; the id names one owner.
+  assert.equal(store.head(loser), null);
+  assert.equal(store.head(winner).generation, 1);
+  assert.equal(store.findAttestation('race-att').deviceId, winner);
+});
+
+test('global id dedup still holds after a service/store restart (durable index)', async () => {
+  const { dir, registry, priv1, priv2 } = await harness();
+  const c1 = config('cfg-dev1');
+  const c2 = config('cfg-dev2');
+
+  const store1 = new AttestationStore(path.join(dir, 'data-restart'));
+  await store1.init();
+  const service1 = createAttestationService({ store: store1, registry, maxPayloadBytes: 64 * 1024 });
+  await service1.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'restart-att'));
+
+  // New process: fresh in-memory index rebuilt from the on-disk logs.
+  const store2 = new AttestationStore(path.join(dir, 'data-restart'));
+  await store2.init();
+  const service2 = createAttestationService({ store: store2, registry, maxPayloadBytes: 64 * 1024 });
+
+  // Exact replay of the original still returns the original result.
+  const replay = await service2.submit(body(priv1, 'key-1', payload('dev1', 1, 0, c1.sha), 'restart-att'));
+  assert.equal(replay.replayed, true);
+
+  // Cross-device reuse of the same id is rejected after restart, too.
+  await assert.rejects(
+    () => service2.submit(body(priv2, 'key-2', payload('dev2', 1, 0, c2.sha), 'restart-att')),
+    (err) => err.status === 409 && err.code === 'GENERATION_CONFLICT',
+  );
+  assert.equal(store2.head('dev2'), null);
+  assert.equal(store2.head('dev1').generation, 1);
+  assert.equal(store2.head('dev1').configSha256, c1.sha);
 });
 
 test('stale predecessor conflicts', async () => {

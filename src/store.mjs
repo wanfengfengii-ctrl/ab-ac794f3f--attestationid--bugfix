@@ -8,16 +8,24 @@ import crypto from 'node:crypto';
  *
  * Per-device log file: <dataDir>/configs/<deviceId>.log
  * One JSON envelope per line, newest last:
- *   {"attestationId","keyId","generation","previousGeneration",
- *    "configSha256","configSize","acceptedAt"}
+ *   {"attestationId","deviceId","keyId","generation","previousGeneration",
+ *    "configSha256","payloadSha256","configSize","acceptedAt"}
  *
  * Durability: every accepted write is flushed (fsync) before the API replies.
  * Restart: logs are replayed, the chain is revalidated, and the in-memory
  * "head" is rebuilt so GET .../head always reports the single accepted tip.
  *
- * Concurrency: accept() for the same device is serialized through a per-device
- * promise chain, so concurrent requests can never observe a torn
- * check-then-append sequence (no forks under races).
+ * Idempotency scope: attestationId is a GLOBALLY unique acceptance number.
+ * The global id -> envelope index spans every device log and is rebuilt from
+ * disk on restart, so the same number can never denote two different devices
+ * or payloads, including across restarts.
+ *
+ * Concurrency: accept() runs every check-then-append decision on one global
+ * commit chain. This is strictly stronger than per-device serialization: the
+ * global attestationId lookup and the durable append happen in one atomic
+ * critical section, so concurrent submissions carrying the same
+ * attestationId (even for different devices) have exactly one deterministic
+ * winner and the other gets a conflict without touching any device's state.
  */
 export class AttestationStore {
   constructor(dataDir) {
@@ -25,10 +33,13 @@ export class AttestationStore {
     this.configsDir = path.join(dataDir, 'configs');
     // deviceId -> {
     //   generation: number, configSha256: string, configSize: number,
-    //   attestations: Map<attestationId, envelope>,
-    //   file: string, chain: Promise
+    //   keyId: string|null, file: string
     // }
     this.devices = new Map();
+    // Global index: attestationId -> accepted envelope, across all devices.
+    this.attestations = new Map();
+    // Single serialization point for all check-then-append decisions.
+    this.chain = Promise.resolve();
   }
 
   async init() {
@@ -43,11 +54,9 @@ export class AttestationStore {
         configSha256: null,
         configSize: 0,
         keyId: null,
-        attestations: new Map(),
         file,
-        chain: Promise.resolve(),
       };
-      await recoverFile(state);
+      await recoverFile(state, this.attestations);
       this.devices.set(deviceId, state);
     }
   }
@@ -67,36 +76,40 @@ export class AttestationStore {
     return [...this.devices.keys()].filter((id) => this.devices.get(id).generation > 0);
   }
 
-  findAttestation(deviceId, attestationId) {
-    const state = this.devices.get(deviceId);
-    return state?.attestations.get(attestationId) ?? null;
+  /**
+   * Look up a previously accepted envelope by attestationId. The id is global
+   * (not per device), so no deviceId argument is needed.
+   */
+  findAttestation(attestationId) {
+    return this.attestations.get(attestationId) ?? null;
   }
 
   /**
-   * Validate-then-append under the device's mutex.
+   * Validate-then-append inside one global critical section.
    * decision(existingHead) must return either:
    *   { action: 'accept', envelope: {...record fields} }
    *   { action: 'reject', status, code, message, details? }
    *   { action: 'replay', envelope: previousEnvelope }  -> returned as accepted(duplicate)
-   * Rejections never touch the log or in-memory state.
+   * Rejections never touch any log or in-memory state.
+   *
+   * Serializing on a single chain (rather than one chain per device) makes the
+   * global attestationId uniqueness check and the durable append atomic even
+   * when the racing submissions target different devices.
    */
   accept(deviceId, decisionFn) {
     let state = this.devices.get(deviceId);
     if (!state) {
-      const file = path.join(this.configsDir, encodeDeviceFile(deviceId));
       state = {
         generation: 0,
         configSha256: null,
         configSize: 0,
         keyId: null,
-        attestations: new Map(),
-        file,
-        chain: Promise.resolve(),
+        file: path.join(this.configsDir, encodeDeviceFile(deviceId)),
       };
       this.devices.set(deviceId, state);
     }
 
-    const run = state.chain.then(async () => {
+    const run = this.chain.then(async () => {
       const existingHead =
         state.generation === 0
           ? null
@@ -118,12 +131,12 @@ export class AttestationStore {
       state.configSha256 = e.configSha256;
       state.configSize = e.configSize;
       state.keyId = e.keyId;
-      state.attestations.set(e.attestationId, e);
+      this.attestations.set(e.attestationId, e);
       return { outcome: 'accept', envelope: e };
     });
 
     // Keep the chain alive even when this request fails, and free it once settled.
-    state.chain = run.then(
+    this.chain = run.then(
       () => undefined,
       () => undefined,
     );
@@ -149,7 +162,7 @@ async function appendDurable(file, line) {
   }
 }
 
-async function recoverFile(state) {
+async function recoverFile(state, globalAttestations) {
   let buf;
   try {
     buf = await fs.readFile(state.file);
@@ -189,10 +202,14 @@ async function recoverFile(state) {
     if (e.generation <= expectedPrev) {
       throw new Error(`Corrupt log ${state.file}: generation did not advance at ${e.generation}`);
     }
-    if (state.attestations.has(e.attestationId)) {
-      throw new Error(`Corrupt log ${state.file}: duplicate attestationId ${e.attestationId}`);
+    if (globalAttestations.has(e.attestationId)) {
+      const owner = globalAttestations.get(e.attestationId);
+      throw new Error(
+        `Corrupt store: attestationId ${e.attestationId} is accepted for both ` +
+          `"${owner.deviceId}" and "${e.deviceId ?? state.file}"`,
+      );
     }
-    state.attestations.set(e.attestationId, e);
+    globalAttestations.set(e.attestationId, e);
     state.generation = e.generation;
     state.configSha256 = e.configSha256;
     state.configSize = e.configSize;
@@ -202,7 +219,15 @@ async function recoverFile(state) {
 }
 
 function validateRecoveredEnvelope(e, file) {
-  const need = ['attestationId', 'keyId', 'generation', 'previousGeneration', 'configSha256'];
+  const need = [
+    'attestationId',
+    'deviceId',
+    'keyId',
+    'generation',
+    'previousGeneration',
+    'configSha256',
+    'payloadSha256',
+  ];
   for (const k of need) {
     if (e[k] === undefined) throw new Error(`Corrupt log ${file}: record missing "${k}"`);
   }
@@ -214,6 +239,9 @@ function validateRecoveredEnvelope(e, file) {
   }
   if (typeof e.configSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(e.configSha256)) {
     throw new Error(`Corrupt log ${file}: bad configSha256`);
+  }
+  if (typeof e.payloadSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(e.payloadSha256)) {
+    throw new Error(`Corrupt log ${file}: bad payloadSha256`);
   }
 }
 

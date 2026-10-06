@@ -11,13 +11,14 @@ function tmpStore() {
   return { dir, store };
 }
 
-const env = (attestationId, gen, prev, sha = 'a'.repeat(64)) => ({
+const env = (attestationId, gen, prev, sha = 'a'.repeat(64), deviceId = 'dev') => ({
   attestationId,
   keyId: 'k1',
-  deviceId: 'dev',
+  deviceId,
   generation: gen,
   previousGeneration: prev,
   configSha256: sha,
+  payloadSha256: 'c'.repeat(64),
   configSize: 10,
   acceptedAt: new Date().toISOString(),
 });
@@ -60,8 +61,8 @@ test('store recovers head and attestation index from disk on restart', async () 
   await reopened.init();
   assert.equal(reopened.head('dev').generation, 2);
   assert.equal(reopened.head('dev').configSha256, 'b'.repeat(64));
-  assert.ok(reopened.findAttestation('dev', 'a1'));
-  assert.ok(reopened.findAttestation('dev', 'a2'));
+  assert.ok(reopened.findAttestation('a1'));
+  assert.ok(reopened.findAttestation('a2'));
 });
 
 test('store truncates a torn trailing record after a crash mid-write', async () => {
@@ -117,9 +118,50 @@ test('store serializes concurrent decisions per device (no fork)', async () => {
 test('store isolates chains for different devices', async () => {
   const { store } = tmpStore();
   await store.init();
-  await store.accept('devA', () => ({ action: 'accept', envelope: env('a1', 1, 0) }));
-  await store.accept('devB', () => ({ action: 'accept', envelope: env('b1', 1, 0) }));
+  await store.accept('devA', () => ({ action: 'accept', envelope: env('a1', 1, 0, 'a'.repeat(64), 'devA') }));
+  await store.accept('devB', () => ({ action: 'accept', envelope: env('b1', 1, 0, 'b'.repeat(64), 'devB') }));
   assert.equal(store.head('devA').generation, 1);
   assert.equal(store.head('devB').generation, 1);
-  assert.equal(store.findAttestation('devA', 'b1'), null);
+  assert.equal(store.findAttestation('b1').deviceId, 'devB');
+  assert.equal(store.findAttestation('a1').deviceId, 'devA');
+});
+
+test('attestationId is global: a second device must decide via the global index', async () => {
+  const { store } = tmpStore();
+  await store.init();
+  await store.accept('devA', () => ({ action: 'accept', envelope: env('shared', 1, 0, 'a'.repeat(64), 'devA') }));
+
+  // Simulate the service's decision: the same global id is visible from another device.
+  const seen = await store.accept('devB', (head) => {
+    const prev = store.findAttestation('shared');
+    assert.equal(head, null);
+    assert.ok(prev, 'global id must be visible from the other device');
+    assert.equal(prev.deviceId, 'devA');
+    if (prev && (prev.deviceId !== 'devB' || prev.payloadSha256 !== 'd'.repeat(64))) {
+      return { action: 'reject', status: 409, code: 'GENERATION_CONFLICT', message: 'cross-device reuse' };
+    }
+    return { action: 'accept', envelope: env('shared', 1, 0, 'a'.repeat(64), 'devB') };
+  });
+  assert.equal(seen.outcome, 'reject');
+  assert.equal(seen.code, 'GENERATION_CONFLICT');
+  // The conflict neither created devB's head nor changed devA.
+  assert.equal(store.head('devB'), null);
+  assert.equal(store.head('devA').generation, 1);
+  assert.equal(store.findAttestation('shared').deviceId, 'devA');
+});
+
+test('global attestation index survives restart and rejects cross-device duplicates on disk', async () => {
+  const { dir, store } = tmpStore();
+  await store.init();
+  await store.accept('devA', () => ({ action: 'accept', envelope: env('a1', 1, 0) }));
+
+  // Fabricate a second device log that reuses the same global id.
+  fs.mkdirSync(path.join(dir, 'configs'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'configs', 'devB.log'),
+    `${JSON.stringify(env('a1', 1, 0, 'b'.repeat(64), 'devB'))}\n`,
+  );
+
+  const reopened = new AttestationStore(dir);
+  await assert.rejects(() => reopened.init(), /both|Corrupt store/);
 });
